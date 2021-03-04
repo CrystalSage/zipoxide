@@ -9,6 +9,8 @@ use std::fs::File;
 const _MAX_PKZ_FILES : u8 = 8;
 const FLAG_LOCAL_SIZE_UNKNOWN : u16 = 8;
 
+
+//The zip archive that we use to handle all the chunks/sectors
 #[derive(Debug)]
 pub struct Zipctx{
     zipname: String,
@@ -19,6 +21,7 @@ pub struct Zipctx{
     cs: String,
 }
 
+//Central Directory
 #[derive(Debug, Default)]
 pub struct CD{
     ver_by : u16,
@@ -40,6 +43,7 @@ pub struct CD{
     ef: Vec<u8>,
 }
 
+//End of Central Directory. This is parsed first.
 #[derive(Debug)]
 pub struct EOCD{
     n_disk        : u16,
@@ -52,6 +56,8 @@ pub struct EOCD{
     comment       : u8,
 }
 
+//Local file header for each archive in the ZIP file
+//A bit ugly at the moment
 #[derive(Debug)]
 pub struct LFH{
     pub ver_needed : u16,
@@ -76,6 +82,8 @@ pub struct LFH{
     hash: Vec<u8>,
 }
 
+
+//Convenient wrappers for little endian
 fn u16_to_le(byteslice: &[u8]) -> u16{
     let mut v : u16 = 0;
     v = v | ((byteslice[1] as u16) << 8);
@@ -93,6 +101,9 @@ fn u32_to_le(byteslice: &[u8]) -> u32{
     v
 }
 
+//Builders for each type of sector. This is where majority 
+//of the logic is. Some things are hardcoded at the moment.
+//Fingers crossed
 impl Zipctx{
     pub fn new(zipname: String, lfheaders : Vec<LFH>, cd: Vec<CD>, eocd : EOCD ) -> Zipctx{
         Zipctx{
@@ -106,6 +117,9 @@ impl Zipctx{
     }
 }
 
+
+//We return a Vec<CD> from here.
+//The Vector contains CD for each archive.
 impl CD{
     pub fn new<R: Read+Seek>(cd_offset: u32, reader : &mut R ) -> Result<Vec<CD>, Box<dyn Error>>{
         reader.seek(SeekFrom::Start(cd_offset as u64))?;
@@ -132,6 +146,8 @@ impl CD{
             let ef_len = u16_to_le(&cd_bytes[30..32]);
             let comment_len = u16_to_le(&cd_bytes[32..34]);
 
+            //Resize and adjust for dynamic fields
+            //We don't expect any comments here. BAD
             let mut filename = vec![0u8;fname_len as usize];
             reader.read_exact(&mut filename).unwrap();
             filename.resize(12, 0);
@@ -195,15 +211,16 @@ impl EOCD{
 
 impl LFH{
     pub fn new<R: Seek+BufRead>(cd: &CD, reader: &mut R) -> Result<Vec<LFH>, Box<dyn Error>>{
-        let mut lfh_bytes : Vec<u8> = vec![0u8; 30];
-        reader.seek(SeekFrom::Start(cd.rel_lfh_offset as u64))?;
-        reader.read_exact(&mut lfh_bytes)?;
 
         //The LFH is expected to be at the most 30 + n + m bytes
         // where n is fname_len and m is ef_len. So we read those
         // two first and then extend the vector accordingly
         // for reading EF and filename
         //
+        let mut lfh_bytes : Vec<u8> = vec![0u8; 30];
+        reader.seek(SeekFrom::Start(cd.rel_lfh_offset as u64))?;
+        reader.read_exact(&mut lfh_bytes)?;
+
         let n = u16_to_le(&lfh_bytes[26..28]) as usize;
         let m = u16_to_le(&lfh_bytes[28..30]) as usize;
 
@@ -279,6 +296,8 @@ fn process_legacy(zipfile: &mut Zipctx) -> Option<u8>{
         }
     }
 
+    //Write a string to Stderr for more verbose info
+    //Don't actually print it
     err_string += format!("{}/{} PKZIP{} Encr: {}{} cmplen={}, decmplen={}, crc={:8x}, ts={:4x}, cs={}, type={}",
                 zipfile.zipname,
                 lfh.file_name,
@@ -303,35 +322,6 @@ fn handle_file_entry(zipfile: &mut Zipctx) -> u8{
     0
 }
 
-pub fn construct_zip(zipfile: &String) -> Result<Zipctx, Box<dyn Error>>{
-    let mut reader = BufReader::new(File::open(zipfile).unwrap());
-
-    let eocd: EOCD= EOCD::new(&mut reader).unwrap_or_else(|err| {
-        eprintln!("Problem parsing EOCD : {}", err);
-        process::exit(1);
-    });
-
-    let cd : Vec<CD> = CD::new(eocd.cd_offset, &mut reader).unwrap_or_else(|err|{
-        eprintln!("Problem parsing EOCD : {}", err);
-        process::exit(1);
-    });
-
-
-    let curzip_cd = &cd[1];
-    let lfheaders : Vec<LFH> = LFH::new(&curzip_cd, &mut reader).unwrap_or_else(|err|{
-        eprintln!("Problem parsing EOCD : {}", err);
-        process::exit(1);
-    });
-
-
-    let mut results: Zipctx = Zipctx::new(zipfile.into(), lfheaders, cd, eocd);
-   // println!("{:x?}", results);
-
-    handle_file_entry(&mut results);
-    write_and_clean(&mut results);
-    Ok(results)
-}
-
 pub fn write_and_clean(ctx : &mut Zipctx){
     let lfh = ctx.lfh.pop().unwrap();
 
@@ -352,3 +342,32 @@ pub fn write_and_clean(ctx : &mut Zipctx){
 
     print!("$/pkzip$:{}:{}::{}\n", lfh.file_name, ctx.zipname, ctx.zipname);
 }
+
+//The "main" module. This parses all the sectors successfully or exits
+pub fn construct_zip(zipfile: &String) -> Result<Zipctx, Box<dyn Error>>{
+    let mut reader = BufReader::new(File::open(zipfile).unwrap());
+
+    let eocd: EOCD= EOCD::new(&mut reader).unwrap_or_else(|err| {
+        eprintln!("Problem parsing EOCD : {}", err);
+        process::exit(1);
+    });
+
+    let cd : Vec<CD> = CD::new(eocd.cd_offset, &mut reader).unwrap_or_else(|err|{
+        eprintln!("Problem parsing EOCD : {}", err);
+        process::exit(1);
+    });
+
+
+    let curzip_cd = &cd[1];
+    let lfheaders : Vec<LFH> = LFH::new(&curzip_cd, &mut reader).unwrap_or_else(|err|{
+        eprintln!("Problem parsing EOCD : {}", err);
+        process::exit(1);
+    });
+
+    let mut results: Zipctx = Zipctx::new(zipfile.into(), lfheaders, cd, eocd);
+
+    handle_file_entry(&mut results);
+    write_and_clean(&mut results);
+    Ok(results)
+}
+
